@@ -2,7 +2,9 @@
 <html lang="ru">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#15110d">
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
 <title>Шахматы 14×14 — Царь горы</title>
 <style>
   :root{
@@ -322,6 +324,28 @@
     .layout{ flex-direction: column; align-items: center; }
     .panel{ width: min(94vw, 620px); }
   }
+
+  /* ===== Telegram Mini App / phone tuning ===== */
+  html{ -webkit-tap-highlight-color: transparent; -webkit-touch-callout: none; overscroll-behavior: none; touch-action: manipulation; }
+  body{ min-height: 100vh; min-height: 100dvh; }
+  .app{ padding-bottom: calc(60px + env(safe-area-inset-bottom, 0px)); }
+
+  @media (max-width: 720px){
+    .app{ padding: 8px 6px calc(48px + env(safe-area-inset-bottom, 0px)); gap: 8px; }
+    header{ margin-bottom: 0; }
+    h1{ font-size: 20px; margin-bottom: 2px; }
+    .subtitle{ font-size: 12px; }
+    .layout{ gap: 12px; }
+    .board-wrap{
+      width: 100%;
+      grid-template-columns: 14px 1fr 14px;
+      grid-template-rows: 14px 1fr 14px;
+      gap: 2px;
+    }
+    .files-row, .ranks-col{ font-size: 9px; letter-spacing: 0; }
+    .panel{ width: 100%; }
+    footer{ display: none; }
+  }
 </style>
 </head>
 <body>
@@ -389,7 +413,7 @@
 <div class="app">
   <header>
     <h1>Шахматы 14×14 — <span>Царь горы</span></h1>
-    <p class="subtitle">Прототип для проверки правил · играйте на одном устройстве по очереди</p>
+    <p class="subtitle">Прототип · игра вдвоём на одном устройстве</p>
   </header>
 
   <div class="layout">
@@ -904,6 +928,7 @@ function render() {
 
   renderStatus();
   renderLog();
+  telegramAfterRender();
 }
 
 function colorLabel(c) { return c === 'w' ? 'Белые' : 'Чёрные'; }
@@ -1044,6 +1069,48 @@ document.getElementById('rulesToggle').addEventListener('click', (e) => {
   body.classList.toggle('show');
   e.target.textContent = body.classList.contains('show') ? 'Скрыть краткие правила' : 'Показать краткие правила варианта';
 });
+
+/* ======================= TELEGRAM ======================= */
+const tg = (window.Telegram && window.Telegram.WebApp) ? window.Telegram.WebApp : null;
+function tgSafe(fn) { try { return fn(); } catch (e) { /* ignore: older Telegram clients */ } }
+function tgAtLeast(v) { return !!(tg && typeof tg.isVersionAtLeast === 'function' && tg.isVersionAtLeast(v)); }
+
+if (tg) {
+  tgSafe(() => tg.ready());
+  tgSafe(() => tg.expand());                                   // open full height right away
+  if (tgAtLeast('7.7')) tgSafe(() => tg.disableVerticalSwipes()); // swipe-down must not close the game
+  if (tgAtLeast('6.9')) tgSafe(() => tg.setHeaderColor('#15110d'));
+  if (tgAtLeast('6.1')) tgSafe(() => tg.setBackgroundColor('#15110d'));
+  if (tgAtLeast('7.10')) tgSafe(() => tg.setBottomBarColor('#15110d'));
+}
+
+function haptic(kind) {
+  if (!tg || !tgAtLeast('6.1') || !tg.HapticFeedback) return;
+  tgSafe(() => {
+    if (kind === 'move') tg.HapticFeedback.impactOccurred('light');
+    else if (kind === 'check') tg.HapticFeedback.notificationOccurred('warning');
+    else if (kind === 'win') tg.HapticFeedback.notificationOccurred('success');
+  });
+}
+
+let tgPrevLog = 0;
+function telegramAfterRender() {
+  if (!tg) return;
+  const len = game.log.length;
+  if (len > tgPrevLog) {
+    if (game.gameOver) haptic(game.winReason === 'stalemate' ? 'check' : 'win');
+    else if (game.isInCheck(game.turn)) haptic('check');
+    else haptic('move');
+  }
+  tgPrevLog = len;
+  if (tgAtLeast('6.2')) {
+    // ask for confirmation before closing while a game is in progress
+    tgSafe(() => {
+      if (game.log.length > 0 && !game.gameOver) tg.enableClosingConfirmation();
+      else tg.disableClosingConfirmation();
+    });
+  }
+}
 
 buildLabels();
 buildBoardSquares();
