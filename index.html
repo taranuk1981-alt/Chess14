@@ -346,6 +346,7 @@
     .panel{ width: 100%; }
     footer{ display: none; }
   }
+  #aiOptions.off{ display: none; }
 </style>
 </head>
 <body>
@@ -413,7 +414,7 @@
 <div class="app">
   <header>
     <h1>Шахматы 14×14 — <span>Царь горы</span></h1>
-    <p class="subtitle">Прототип · игра вдвоём на одном устройстве</p>
+    <p class="subtitle">Прототип · против компьютера или вдвоём</p>
   </header>
 
   <div class="layout">
@@ -441,16 +442,38 @@
       <div class="banner" id="gameOverBanner"></div>
 
       <div class="card">
+        <button class="btn primary" id="restartBtn">Новая партия</button>
+      </div>
+
+      <div class="card">
+        <div class="settings-label">Режим игры</div>
+        <div class="segmented" id="modeSeg">
+          <button class="seg-btn active" data-value="ai">Против компьютера</button>
+          <button class="seg-btn" data-value="two">Вдвоём</button>
+        </div>
+        <div id="aiOptions">
+          <div class="settings-label" style="margin-top:12px">Сложность компьютера</div>
+          <div class="segmented" id="levelSeg">
+            <button class="seg-btn" data-value="easy">Лёгкий</button>
+            <button class="seg-btn active" data-value="medium">Средний</button>
+            <button class="seg-btn" data-value="hard">Сильный</button>
+          </div>
+          <div class="settings-label" style="margin-top:12px">Вы играете</div>
+          <div class="segmented" id="colorSeg">
+            <button class="seg-btn active" data-value="w">Белыми</button>
+            <button class="seg-btn" data-value="b">Чёрными</button>
+          </div>
+        </div>
+        <div class="settings-note">Смена режима или цвета начинает новую партию. Сложность можно менять прямо во время игры.</div>
+      </div>
+
+      <div class="card">
         <div class="settings-label">Условие победы «Царь горы»</div>
         <div class="segmented" id="difficultySeg">
           <button class="seg-btn active" data-value="1">1 ход соперника</button>
           <button class="seg-btn" data-value="2">2 хода соперника</button>
         </div>
         <div class="settings-note" id="difficultyNote">Король побеждает, если сразу следующим ходом соперник не объявит шах.</div>
-      </div>
-
-      <div class="card">
-        <button class="btn primary" id="restartBtn">Новая партия</button>
       </div>
 
       <div class="card">
@@ -482,6 +505,492 @@
   </div>
 </div>
 
+<script type="text/plain" id="aiCore">
+function createEngine() {
+  'use strict';
+  const N = 14, SQ = 196, INF = 1000000, MATE = 30000, MAXPLY = 64, SLOT = 768;
+
+  // piece codes: 1=P 2=N 3=B 4=R 5=Q 6=K ; white positive, black negative
+  const board = new Int8Array(SQ);
+  const moved = new Uint8Array(SQ);
+  const kingSq = new Int16Array(2);          // [white, black]
+  const pending = new Int8Array(2);          // -1 = not holding the center, else opponent moves survived
+  let turn = 1, holdRequired = 1, cw = 0, evalScore = 0, npm = 0, inChk = false;
+  pending[0] = -1; pending[1] = -1;
+
+  const FILE = new Int8Array(SQ), RANK = new Int8Array(SQ), CD2 = new Int8Array(SQ);
+  for (let s = 0; s < SQ; s++) {
+    FILE[s] = s % N; RANK[s] = (s / N) | 0;
+    CD2[s] = Math.max(Math.abs(2 * FILE[s] - 13), Math.abs(2 * RANK[s] - 13));
+  }
+  const inB = (f, r) => f >= 0 && f < N && r >= 0 && r < N;
+  const ci = (c) => (c === 1 ? 0 : 1);
+  const isCenter = (s) => { const f = FILE[s], r = RANK[s]; return (f === 6 || f === 7) && (r === 6 || r === 7); };
+
+  // ---- precomputed geometry ----
+  const KNIGHT_OFFS = [[1,2],[2,1],[2,-1],[1,-2],[-1,-2],[-2,-1],[-2,1],[-1,2]];
+  const DIRS = [[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]];
+  const KNIGHT = [], KING = [], RAYS = [], PAWNATT = [[], []], PAWNCAP = [[], []];
+  for (let s = 0; s < SQ; s++) {
+    const f = FILE[s], r = RANK[s];
+    const kn = [], kg = [];
+    for (const [df, dr] of KNIGHT_OFFS) if (inB(f + df, r + dr)) kn.push((r + dr) * N + f + df);
+    for (const [df, dr] of DIRS) if (inB(f + df, r + dr)) kg.push((r + dr) * N + f + df);
+    KNIGHT.push(Int16Array.from(kn)); KING.push(Int16Array.from(kg));
+    for (let d = 0; d < 8; d++) {
+      const ray = []; let nf = f + DIRS[d][0], nr = r + DIRS[d][1];
+      while (inB(nf, nr)) { ray.push(nr * N + nf); nf += DIRS[d][0]; nr += DIRS[d][1]; }
+      RAYS.push(Int16Array.from(ray));
+    }
+    for (let c = 0; c < 2; c++) {
+      const dir = c === 0 ? 1 : -1, att = [], cap = [];
+      for (const df of [-1, 1]) {
+        if (inB(f + df, r - dir)) att.push((r - dir) * N + f + df);   // squares a pawn of this color attacks us from
+        if (inB(f + df, r + dir)) cap.push((r + dir) * N + f + df);   // squares a pawn of this color on s captures onto
+      }
+      PAWNATT[c].push(Int16Array.from(att)); PAWNCAP[c].push(Int16Array.from(cap));
+    }
+  }
+
+  // ---- evaluation tables ----
+  const MATV = [0, 100, 320, 330, 500, 900, 0];
+  const NPMV = [0, 0, 320, 330, 500, 900, 0];
+  const PST = []; for (let t = 0; t < 7; t++) PST.push(new Int16Array(SQ));
+  for (let s = 0; s < SQ; s++) {
+    const r = RANK[s], c = 13 - CD2[s];            // c: 0 (edge) .. 12 (center)
+    PST[1][s] = (r <= 2 ? 0 : (r - 2) * 5 + (r >= 10 ? (r - 9) * 15 : 0)) + (c >> 1);
+    PST[2][s] = c * 3;
+    PST[3][s] = Math.round(c * 1.5);
+    PST[4][s] = (r >= 9 ? 8 : 0) + (c >> 1);
+    PST[5][s] = c;
+  }
+  const VAL = new Int16Array(13 * SQ);
+  for (let code = -6; code <= 6; code++) {
+    if (code === 0) continue;
+    const t = Math.abs(code);
+    for (let s = 0; s < SQ; s++) {
+      if (code > 0) VAL[(code + 6) * SQ + s] = MATV[t] + PST[t][s];
+      else { const m = (13 - RANK[s]) * N + FILE[s]; VAL[(code + 6) * SQ + s] = -(MATV[t] + PST[t][m]); }
+    }
+  }
+
+  // ---- attack detection ----
+  function isAttacked(sq, by) {
+    const nk = KNIGHT[sq], nt = by * 2;
+    for (let i = 0; i < nk.length; i++) if (board[nk[i]] === nt) return true;
+    const kg = KING[sq], kt = by * 6;
+    for (let i = 0; i < kg.length; i++) if (board[kg[i]] === kt) return true;
+    const pa = PAWNATT[by === 1 ? 0 : 1][sq];
+    for (let i = 0; i < pa.length; i++) if (board[pa[i]] === by) return true;
+    const r4 = by * 4, r5 = by * 5, b3 = by * 3;
+    for (let d = 0; d < 4; d++) {
+      const ray = RAYS[sq * 8 + d];
+      for (let i = 0; i < ray.length; i++) {
+        const v = board[ray[i]];
+        if (v !== 0) { if (v === r4 || v === r5) return true; break; }
+      }
+    }
+    for (let d = 4; d < 8; d++) {
+      const ray = RAYS[sq * 8 + d];
+      for (let i = 0; i < ray.length; i++) {
+        const v = board[ray[i]];
+        if (v !== 0) { if (v === b3 || v === r5) return true; break; }
+      }
+    }
+    return false;
+  }
+
+  // ---- move generation (pseudo-legal) ----
+  const moveBuf = new Int32Array((MAXPLY + 2) * SLOT);
+  const scoreBuf = new Int32Array((MAXPLY + 2) * SLOT);
+  const SCRATCH = (MAXPLY + 1) * SLOT;
+
+  function genMoves(base, capturesOnly) {
+    let n = base;
+    const side = turn, cIdx = ci(turn);
+    for (let sq = 0; sq < SQ; sq++) {
+      const p = board[sq];
+      if (p === 0 || (p > 0) !== (side > 0)) continue;
+      const t = p > 0 ? p : -p;
+      if (t === 1) {
+        const r = RANK[sq];
+        if (!capturesOnly) {
+          const r1 = r + side;
+          if (r1 >= 0 && r1 < N) {
+            const s1 = sq + side * N;
+            if (board[s1] === 0) {
+              const promo = side === 1 ? r1 === 13 : r1 === 0;
+              moveBuf[n++] = sq | (s1 << 8) | ((promo ? 4 : 0) << 16);
+              if (!moved[sq]) {
+                const r2 = r + 2 * side;
+                if (r2 >= 0 && r2 < N) {
+                  const s2 = sq + 2 * side * N;
+                  if (board[s2] === 0) {
+                    const pr2 = side === 1 ? r2 === 13 : r2 === 0;
+                    moveBuf[n++] = sq | (s2 << 8) | ((pr2 ? 4 : 0) << 16);
+                    const r3 = r + 3 * side;
+                    if (r3 >= 0 && r3 < N) {
+                      const s3 = sq + 3 * side * N;
+                      if (board[s3] === 0) {
+                        const pr3 = side === 1 ? r3 === 13 : r3 === 0;
+                        moveBuf[n++] = sq | (s3 << 8) | ((pr3 ? 4 : 0) << 16);
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        const cap = PAWNCAP[cIdx][sq];
+        for (let i = 0; i < cap.length; i++) {
+          const to = cap[i], v = board[to];
+          if (v !== 0 && (v > 0) !== (side > 0)) {
+            const promo = side === 1 ? RANK[to] === 13 : RANK[to] === 0;
+            moveBuf[n++] = sq | (to << 8) | ((1 | (promo ? 4 : 0)) << 16);
+          }
+        }
+      } else if (t === 2 || t === 6) {
+        const list = t === 2 ? KNIGHT[sq] : KING[sq];
+        for (let i = 0; i < list.length; i++) {
+          const to = list[i], v = board[to];
+          if (v === 0) { if (!capturesOnly) moveBuf[n++] = sq | (to << 8); }
+          else if ((v > 0) !== (side > 0)) moveBuf[n++] = sq | (to << 8) | (1 << 16);
+        }
+        if (t === 6 && !capturesOnly && !moved[sq] && !inChk) n = genCastle(n, sq, side);
+      } else {
+        const d0 = t === 3 ? 4 : 0, d1 = t === 4 ? 4 : 8;
+        for (let d = d0; d < d1; d++) {
+          const ray = RAYS[sq * 8 + d];
+          for (let i = 0; i < ray.length; i++) {
+            const to = ray[i], v = board[to];
+            if (v === 0) { if (!capturesOnly) moveBuf[n++] = sq | (to << 8); }
+            else { if ((v > 0) !== (side > 0)) moveBuf[n++] = sq | (to << 8) | (1 << 16); break; }
+          }
+        }
+      }
+    }
+    return n - base;
+  }
+
+  function genCastle(n, ksq, side) {
+    const opp = -side, r = RANK[ksq], f = FILE[ksq];
+    // queenside: rook on the B-file, king moves 3 squares toward it
+    let rsq = r * N + 1;
+    if (board[rsq] === side * 4 && !moved[rsq] && f - 3 >= 0) {
+      const a = ksq - 1, b = ksq - 2, c = ksq - 3;
+      if (board[a] === 0 && board[b] === 0 && board[c] === 0 &&
+          !isAttacked(a, opp) && !isAttacked(b, opp) && !isAttacked(c, opp))
+        moveBuf[n++] = ksq | (c << 8) | (2 << 16);
+    }
+    // kingside: rook on the M-file
+    rsq = r * N + 12;
+    if (board[rsq] === side * 4 && !moved[rsq] && f + 3 < N) {
+      const a = ksq + 1, b = ksq + 2, c = ksq + 3;
+      if (board[a] === 0 && board[b] === 0 && board[c] === 0 &&
+          !isAttacked(a, opp) && !isAttacked(b, opp) && !isAttacked(c, opp))
+        moveBuf[n++] = ksq | (c << 8) | (2 << 16);
+    }
+    return n;
+  }
+
+  // ---- make / unmake ----
+  const sFrom = new Int16Array(256), sTo = new Int16Array(256), sFl = new Int8Array(256);
+  const sCap = new Int8Array(256), sP = new Int8Array(256), sMF = new Uint8Array(256), sMT = new Uint8Array(256);
+  const sEval = new Int32Array(256), sNpm = new Int32Array(256);
+  const sKS0 = new Int16Array(256), sKS1 = new Int16Array(256);
+  const sP0 = new Int8Array(256), sP1 = new Int8Array(256), sCw = new Int8Array(256), sChk = new Uint8Array(256);
+  let sp = 0;
+
+  function make(m) {
+    const from = m & 255, to = (m >> 8) & 255, fl = (m >> 16) & 15;
+    const p = board[from], cap = board[to], k = sp++;
+    sFrom[k] = from; sTo[k] = to; sFl[k] = fl; sCap[k] = cap; sP[k] = p;
+    sMF[k] = moved[from]; sMT[k] = moved[to]; sEval[k] = evalScore; sNpm[k] = npm;
+    sKS0[k] = kingSq[0]; sKS1[k] = kingSq[1]; sP0[k] = pending[0]; sP1[k] = pending[1];
+    sCw[k] = cw; sChk[k] = inChk ? 1 : 0;
+    let np = p;
+    if (fl & 4) np = p > 0 ? 5 : -5;
+    evalScore += VAL[(np + 6) * SQ + to] - VAL[(p + 6) * SQ + from];
+    if (cap !== 0) { evalScore -= VAL[(cap + 6) * SQ + to]; npm -= NPMV[cap > 0 ? cap : -cap]; }
+    if (fl & 4) npm += NPMV[5];
+    board[to] = np; moved[to] = 1; board[from] = 0; moved[from] = 0;
+    if (p === 6) kingSq[0] = to; else if (p === -6) kingSq[1] = to;
+    if (fl & 2) {
+      const rank = RANK[from];
+      let rf, rt;
+      if (to > from) { rf = rank * N + 12; rt = to - 1; } else { rf = rank * N + 1; rt = to + 1; }
+      const rk = board[rf];
+      board[rf] = 0; moved[rf] = 0; board[rt] = rk; moved[rt] = 1;
+      evalScore += VAL[(rk + 6) * SQ + rt] - VAL[(rk + 6) * SQ + rf];
+    }
+    turn = -turn;
+  }
+
+  // applies the variant rules (check, center hold) after a legal move; stm is now the opponent of the mover
+  function commit() {
+    const mover = -turn, other = turn, oi = ci(other), mi = ci(mover);
+    const otherInCheck = isAttacked(kingSq[oi], mover);
+    cw = 0;
+    if (pending[oi] >= 0) {
+      if (otherInCheck) pending[oi] = -1;
+      else { pending[oi]++; if (pending[oi] >= holdRequired) cw = other; }
+    }
+    if (isCenter(kingSq[mi])) { if (pending[mi] < 0) pending[mi] = 0; }
+    else pending[mi] = -1;
+    inChk = otherInCheck;
+  }
+
+  function unmake() {
+    const k = --sp;
+    turn = -turn;
+    const from = sFrom[k], to = sTo[k], fl = sFl[k];
+    board[from] = sP[k]; moved[from] = sMF[k]; board[to] = sCap[k]; moved[to] = sMT[k];
+    if (fl & 2) {
+      const rank = RANK[from];
+      let rf, rt;
+      if (to > from) { rf = rank * N + 12; rt = to - 1; } else { rf = rank * N + 1; rt = to + 1; }
+      const rk = board[rt];
+      board[rt] = 0; moved[rt] = 0; board[rf] = rk; moved[rf] = 0;
+    }
+    evalScore = sEval[k]; npm = sNpm[k];
+    kingSq[0] = sKS0[k]; kingSq[1] = sKS1[k];
+    pending[0] = sP0[k]; pending[1] = sP1[k]; cw = sCw[k]; inChk = sChk[k] === 1;
+  }
+
+  function hasLegalMove() {
+    const n = genMoves(SCRATCH, false);
+    for (let i = 0; i < n; i++) {
+      make(moveBuf[SCRATCH + i]);
+      const bad = isAttacked(kingSq[ci(-turn)], turn);
+      unmake();
+      if (!bad) return true;
+    }
+    return false;
+  }
+
+  // ---- evaluation ----
+  function evaluate() {
+    let s = evalScore;
+    if (npm < 4000) s += Math.round(((4000 - npm) / 4000) * 3 * (CD2[kingSq[1]] - CD2[kingSq[0]]));
+    if (s > 600 || s < -600) {
+      // lopsided position: the side that is ahead brings pieces close to the enemy king and pushes it away from the center
+      const w = s > 0 ? 1 : -1, ek = kingSq[w === 1 ? 1 : 0], ef = FILE[ek], er = RANK[ek];
+      let att = 0;
+      for (let sq = 0; sq < SQ; sq++) {
+        const p = board[sq] * w;
+        if (p >= 2 && p <= 5) {
+          const d = Math.max(Math.abs(FILE[sq] - ef), Math.abs(RANK[sq] - er));
+          att += (14 - d) * (p === 5 ? 3 : p === 4 ? 2 : 1);
+        }
+      }
+      s += w * ((att >> 1) + CD2[ek] * 2);
+    }
+    return turn === 1 ? s : -s;
+  }
+
+  // ---- search ----
+  let nodes = 0, deadline = 0, stop = false, canStop = false;
+  const killers = new Int32Array((MAXPLY + 2) * 2);
+  const hist = new Int32Array(14 * SQ);
+  const VICT = [0, 1, 3, 3, 5, 9, 0];
+
+  function scoreMoves(base, n, ply) {
+    const k0 = killers[ply * 2], k1 = killers[ply * 2 + 1];
+    for (let i = 0; i < n; i++) {
+      const m = moveBuf[base + i], from = m & 255, to = (m >> 8) & 255, fl = (m >> 16) & 15;
+      const p = board[from], t = p > 0 ? p : -p;
+      let sc = 0;
+      if (fl & 1) { const v = board[to]; sc = 100000 + VICT[v > 0 ? v : -v] * 100 - t; }
+      else if (fl & 4) sc = 90000;
+      else if (m === k0) sc = 80000;
+      else if (m === k1) sc = 79000;
+      else sc = hist[(p + 7) * SQ + to] | 0;
+      if (t === 6 && isCenter(to)) sc += 95000;
+      scoreBuf[base + i] = sc;
+    }
+  }
+  function pickBest(base, n, i) {
+    let bi = i, bs = scoreBuf[base + i];
+    for (let j = i + 1; j < n; j++) if (scoreBuf[base + j] > bs) { bs = scoreBuf[base + j]; bi = j; }
+    if (bi !== i) {
+      const tm = moveBuf[base + i]; moveBuf[base + i] = moveBuf[base + bi]; moveBuf[base + bi] = tm;
+      const ts = scoreBuf[base + i]; scoreBuf[base + i] = scoreBuf[base + bi]; scoreBuf[base + bi] = ts;
+    }
+    return moveBuf[base + i];
+  }
+
+  function tick() {
+    nodes++;
+    if ((nodes & 2047) === 0 && canStop && Date.now() > deadline) stop = true;
+  }
+
+  function qsearch(alpha, beta, ply) {
+    tick();
+    if (stop) return 0;
+    if (cw !== 0 && hasLegalMove()) return MATE - ply;
+    const stand = evaluate();
+    if (ply >= MAXPLY - 1) return stand;
+    if (stand >= beta) return stand;
+    if (stand > alpha) alpha = stand;
+    const base = ply * SLOT;
+    const n = genMoves(base, true);
+    scoreMoves(base, n, ply);
+    let best = stand;
+    for (let i = 0; i < n; i++) {
+      const m = pickBest(base, n, i);
+      make(m);
+      if (isAttacked(kingSq[ci(-turn)], turn)) { unmake(); continue; }
+      commit();
+      const sc = -qsearch(-beta, -alpha, ply + 1);
+      unmake();
+      if (stop) return 0;
+      if (sc > best) { best = sc; if (sc > alpha) { alpha = sc; if (alpha >= beta) break; } }
+    }
+    return best;
+  }
+
+  function negamax(depth, alpha, beta, ply, ex) {
+    tick();
+    if (stop) return 0;
+    if (cw !== 0 && hasLegalMove()) return MATE - ply;   // the holder of the center wins
+    if (ply >= MAXPLY - 1) return evaluate();
+    const inCheck = inChk;
+    if (depth < 1 && ex < 4 && (inCheck || pending[0] >= 0 || pending[1] >= 0)) { depth = 1; ex++; }
+    if (depth <= 0) return qsearch(alpha, beta, ply);
+    const base = ply * SLOT;
+    const n = genMoves(base, false);
+    scoreMoves(base, n, ply);
+    let best = -INF, legal = 0;
+    for (let i = 0; i < n; i++) {
+      const m = pickBest(base, n, i);
+      make(m);
+      if (isAttacked(kingSq[ci(-turn)], turn)) { unmake(); continue; }
+      commit();
+      legal++;
+      const sc = -negamax(depth - 1, -beta, -alpha, ply + 1, ex);
+      const quiet = !((m >> 16) & 5);
+      const pidx = (sP[sp - 1] + 7) * SQ + ((m >> 8) & 255);
+      unmake();
+      if (stop) return 0;
+      if (sc > best) {
+        best = sc;
+        if (sc > alpha) {
+          alpha = sc;
+          if (alpha >= beta) {
+            if (quiet) {
+              if (killers[ply * 2] !== m) { killers[ply * 2 + 1] = killers[ply * 2]; killers[ply * 2] = m; }
+              hist[pidx] += depth * depth;
+            }
+            break;
+          }
+        }
+      }
+    }
+    if (legal === 0) return inCheck ? -(MATE - ply) : 0;
+    return best;
+  }
+
+  // ---- public API ----
+  function setPosition(s) {
+    board.set(s.board); moved.set(s.moved);
+    turn = s.turn; holdRequired = s.holdRequired;
+    pending[0] = s.pending[0]; pending[1] = s.pending[1];
+    evalScore = 0; npm = 0; cw = 0; sp = 0;
+    for (let sq = 0; sq < SQ; sq++) {
+      const p = board[sq];
+      if (p === 0) continue;
+      evalScore += VAL[(p + 6) * SQ + sq];
+      npm += NPMV[p > 0 ? p : -p];
+      if (p === 6) kingSq[0] = sq; else if (p === -6) kingSq[1] = sq;
+    }
+    inChk = isAttacked(kingSq[ci(turn)], -turn);
+  }
+
+  function legalMoves() {
+    const out = [], n = genMoves(SCRATCH, false), tmp = [];
+    for (let i = 0; i < n; i++) tmp.push(moveBuf[SCRATCH + i]);
+    for (const m of tmp) {
+      make(m);
+      const bad = isAttacked(kingSq[ci(-turn)], turn);
+      unmake();
+      if (!bad) out.push(m);
+    }
+    return out;
+  }
+  const decode = (m) => ({ from: m & 255, to: (m >> 8) & 255, flags: (m >> 16) & 15 });
+
+  function status() {
+    if (!hasLegalMove()) return inChk ? { over: true, winner: -turn, reason: 'checkmate' } : { over: true, winner: 0, reason: 'stalemate' };
+    if (cw !== 0) return { over: true, winner: cw, reason: 'centerHold' };
+    return { over: false };
+  }
+
+  const LEVELS = {
+    easy:   { maxDepth: 1, time: 500,  margin: 70, blunder: 0.12, exactAll: true },
+    medium: { maxDepth: 5, time: 1000, margin: 0,  blunder: 0,    exactAll: false },
+    hard:   { maxDepth: 10, time: 2500, margin: 0,  blunder: 0,    exactAll: false },
+  };
+
+  function search(s, opts) {
+    const t0 = Date.now();
+    setPosition(s);
+    const L = Object.assign({}, LEVELS[(opts && opts.level) || 'medium'], opts || {});
+    nodes = 0; stop = false; canStop = true; deadline = t0 + L.time * 2.5;
+    killers.fill(0); hist.fill(0);
+
+    let roots = legalMoves();
+    if (roots.length === 0) return null;
+    const finish = (m, score, depth) => ({ from: m & 255, to: (m >> 8) & 255, promo: ((m >> 16) & 4) ? 'Q' : null, score, depth, nodes, ms: Date.now() - t0 });
+    if (roots.length === 1) return finish(roots[0], 0, 0);
+    if (L.blunder > 0 && Math.random() < L.blunder) return finish(roots[(Math.random() * roots.length) | 0], 0, 0);
+
+    // initial ordering: captures / promotions first
+    const rootInit = roots.map(m => {
+      const to = (m >> 8) & 255, fl = (m >> 16) & 15, v = board[to];
+      return { m, s: (fl & 1 ? 1000 + VICT[v > 0 ? v : -v] * 10 : 0) + (fl & 4 ? 900 : 0) };
+    });
+    rootInit.sort((a, b) => b.s - a.s);
+    roots = rootInit.map(x => x.m);
+
+    let bestMove = roots[0], bestScore = 0, doneDepth = 0;
+    for (let depth = 1; depth <= L.maxDepth; depth++) {
+      deadline = depth === 1 ? t0 + L.time * 2.5 : t0 + L.time;
+      const scored = [];
+      let curBest = -INF;
+      let aborted = false;
+      for (let i = 0; i < roots.length; i++) {
+        const m = roots[i];
+        make(m); commit();
+        const lo = (i === 0 || L.exactAll) ? -INF : curBest - 1;
+        const sc = -negamax(depth - 1, -INF, -lo, 1, 0);
+        unmake();
+        if (stop) { aborted = true; break; }
+        scored.push({ m, sc });
+        if (sc > curBest) curBest = sc;
+      }
+      if (aborted) {
+        if (depth === 1 && scored.length) { scored.sort((a, b) => b.sc - a.sc); bestMove = scored[0].m; bestScore = scored[0].sc; }
+        break;
+      }
+      scored.sort((a, b) => b.sc - a.sc);
+      roots = scored.map(x => x.m);
+      const top = scored[0].sc;
+      const pool = scored.filter(x => x.sc >= top - Math.max(L.margin, 0) && (L.margin > 0 || x.sc === top));
+      bestMove = pool[(Math.random() * pool.length) | 0].m;
+      bestScore = top; doneDepth = depth;
+      if (Math.abs(top) > MATE - 100) break;
+      if (Date.now() > deadline) break;
+    }
+    return finish(bestMove, bestScore, doneDepth);
+  }
+
+  return { setPosition, legalMoves, decode, status, search, LEVELS,
+           play: (m) => { make(m); commit(); }, undo: () => unmake(),
+           get turn() { return turn; }, get cw() { return cw; }, get pending() { return [pending[0], pending[1]]; } };
+}
+
+</script>
 <script>
 /* ======================= ENGINE ======================= */
 </script>
@@ -817,6 +1326,8 @@ function makePieceIcon(type, color) {
 }
 
 let currentHoldRequired = 1;
+let vsComputer = true, aiLevel = 'medium', humanColor = 'w', flipped = false;
+let aiBusy = false, aiReq = 0, aiPending = null;
 let game = new Game(currentHoldRequired);
 let selected = null;      // {f, r}
 let legalMoves = [];      // legal moves for selected piece
@@ -835,11 +1346,14 @@ const promoOverlay = document.getElementById('promoOverlay');
 const promoChoices = document.getElementById('promoChoices');
 
 function buildLabels() {
-  for (let f = 0; f < SIZE; f++) {
+  filesTop.innerHTML = ''; filesBottom.innerHTML = ''; ranksLeft.innerHTML = ''; ranksRight.innerHTML = '';
+  for (let i = 0; i < SIZE; i++) {
+    const f = flipped ? SIZE - 1 - i : i;
     const t = document.createElement('div'); t.textContent = FILES[f]; filesTop.appendChild(t);
     const b = document.createElement('div'); b.textContent = FILES[f]; filesBottom.appendChild(b);
   }
-  for (let rank = 14; rank >= 1; rank--) {
+  for (let i = 0; i < SIZE; i++) {
+    const rank = flipped ? i + 1 : 14 - i;
     const l = document.createElement('div'); l.textContent = rank; ranksLeft.appendChild(l);
     const r = document.createElement('div'); r.textContent = rank; ranksRight.appendChild(r);
   }
@@ -847,9 +1361,10 @@ function buildLabels() {
 
 function buildBoardSquares() {
   boardEl.innerHTML = '';
-  for (let rank = 14; rank >= 1; rank--) {
-    const r = rank - 1;
-    for (let f = 0; f < SIZE; f++) {
+  for (let i = 0; i < SIZE; i++) {
+    const r = flipped ? i : SIZE - 1 - i;
+    for (let j = 0; j < SIZE; j++) {
+      const f = flipped ? SIZE - 1 - j : j;
       const sq = document.createElement('div');
       const isLight = (f + r) % 2 === 0;
       sq.className = 'sq ' + (isLight ? 'light' : 'dark');
@@ -863,8 +1378,9 @@ function buildBoardSquares() {
 
 function squareEl(f, r) {
   // grid children ordered rank14->1, file A->N (matches buildBoardSquares order)
-  const displayRow = 14 - (r + 1); // 0-indexed row from top
-  const idx = displayRow * SIZE + f;
+  const displayRow = flipped ? r : SIZE - 1 - r; // 0-indexed row from top
+  const displayCol = flipped ? SIZE - 1 - f : f;
+  const idx = displayRow * SIZE + displayCol;
   return boardEl.children[idx];
 }
 
@@ -929,13 +1445,18 @@ function render() {
   renderStatus();
   renderLog();
   telegramAfterRender();
+  scheduleAi();
 }
 
 function colorLabel(c) { return c === 'w' ? 'Белые' : 'Чёрные'; }
 
 function renderStatus() {
   turnSwatch.className = 'swatch ' + game.turn;
-  turnLabel.textContent = 'Ход: ' + colorLabel(game.turn);
+  if (vsComputer && !game.gameOver) {
+    turnLabel.textContent = aiBusy ? 'Компьютер думает…' : (game.turn === humanColor ? 'Ваш ход (' + colorLabel(game.turn).toLowerCase() + ')' : 'Ход компьютера');
+  } else {
+    turnLabel.textContent = 'Ход: ' + colorLabel(game.turn);
+  }
 
   let lines = [];
   let cls = '';
@@ -975,6 +1496,9 @@ function renderStatus() {
     } else if (game.winReason === 'centerHold') {
       gameOverBanner.innerHTML = '<b>Царь горы!</b> ' + colorLabel(game.winner) + ' удержали центр и побеждают.';
     }
+    if (vsComputer && game.winner) {
+      gameOverBanner.innerHTML += game.winner === humanColor ? ' <b>Вы победили!</b>' : ' Победил компьютер.';
+    }
   } else {
     gameOverBanner.classList.remove('show');
   }
@@ -995,7 +1519,8 @@ function renderLog() {
 }
 
 function onSquareClick(e) {
-  if (game.gameOver || game.pendingPromotion) return;
+  if (game.gameOver || game.pendingPromotion || aiBusy) return;
+  if (vsComputer && game.turn !== humanColor) return;
   const f = +e.currentTarget.dataset.f;
   const r = +e.currentTarget.dataset.r;
   const piece = game.getPiece(f, r);
@@ -1043,11 +1568,116 @@ function openPromotionModal() {
   promoOverlay.classList.add('show');
 }
 
-document.getElementById('restartBtn').addEventListener('click', () => {
-  game = new Game(currentHoldRequired);
+/* ======================= COMPUTER OPPONENT ======================= */
+const AI_CODE = document.getElementById('aiCore').textContent;
+const PIECE_CODE = { P: 1, N: 2, B: 3, R: 4, Q: 5, K: 6 };
+let aiWorker = null;      // null = not created yet, false = unavailable (use the main thread)
+let aiMainEngine = null;
+
+function serializeForAI() {
+  const board = new Int8Array(196), moved = new Uint8Array(196);
+  for (let r = 0; r < SIZE; r++) for (let f = 0; f < SIZE; f++) {
+    const p = game.board[r][f];
+    if (!p) continue;
+    board[r * SIZE + f] = PIECE_CODE[p.type] * (p.color === 'w' ? 1 : -1);
+    moved[r * SIZE + f] = p.moved ? 1 : 0;
+  }
+  return {
+    board, moved, turn: game.turn === 'w' ? 1 : -1, holdRequired: game.holdRequired,
+    pending: [game.pending.w === null ? -1 : game.pending.w, game.pending.b === null ? -1 : game.pending.b],
+  };
+}
+
+function runAiOnMainThread(job) {
+  setTimeout(() => {
+    let result = null;
+    try {
+      if (!aiMainEngine) aiMainEngine = new Function(AI_CODE + '; return createEngine();')();
+      result = aiMainEngine.search(job.pos, { level: job.level });
+    } catch (e) { result = null; }
+    handleAiResult(job.id, result);
+  }, 30);
+}
+
+function getAiWorker() {
+  if (aiWorker !== null) return aiWorker || null;
+  try {
+    const src = AI_CODE + '\nconst __engine = createEngine();\nself.onmessage = function (ev) {\n  var d = ev.data, r = null;\n  try { r = __engine.search(d.pos, { level: d.level }); } catch (err) { r = null; }\n  self.postMessage({ id: d.id, result: r });\n};';
+    const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+    aiWorker = new Worker(url);
+    aiWorker.onmessage = (ev) => handleAiResult(ev.data.id, ev.data.result);
+    aiWorker.onerror = () => {
+      aiWorker = false;
+      if (aiPending) runAiOnMainThread(aiPending);   // the worker failed: finish this move on the main thread
+    };
+  } catch (e) { aiWorker = false; }
+  return aiWorker || null;
+}
+
+function cancelAi() {
+  aiReq++; aiBusy = false; aiPending = null;
+  if (aiWorker) { try { aiWorker.terminate(); } catch (e) {} aiWorker = null; }
+}
+
+function scheduleAi() {
+  if (!vsComputer || aiBusy || game.gameOver || game.pendingPromotion || game.turn === humanColor) return;
+  aiBusy = true;
+  const job = { id: ++aiReq, pos: serializeForAI(), level: aiLevel };
+  aiPending = job;
+  renderStatus();
+  setTimeout(() => {              // let the screen repaint ("thinking...") before the search starts
+    if (job.id !== aiReq) return;
+    const w = getAiWorker();
+    if (w) w.postMessage(job); else runAiOnMainThread(job);
+  }, 60);
+}
+
+function handleAiResult(id, r) {
+  if (id !== aiReq || !aiBusy) return;
+  aiBusy = false; aiPending = null;
+  let done = false;
+  if (r && typeof r.from === 'number') {
+    const res = game.makeMove(r.from % SIZE, Math.floor(r.from / SIZE), r.to % SIZE, Math.floor(r.to / SIZE));
+    if (res.needsPromotion) { game.finalizePromotion(r.promo || 'Q'); done = true; }
+    else if (res.ok) done = true;
+  }
+  if (!done) {                    // safety net: never leave the game stuck, play any legal move
+    const all = game.getAllLegalMoves(game.turn);
+    if (all.length) {
+      const m = all[Math.floor(Math.random() * all.length)];
+      const res = game.makeMove(m.fromF, m.fromR, m.toF, m.toR);
+      if (res.needsPromotion) game.finalizePromotion('Q');
+    }
+  }
   selected = null; legalMoves = [];
   render();
+}
+
+function startNewGame() {
+  cancelAi();
+  game = new Game(currentHoldRequired);
+  selected = null; legalMoves = [];
+  const wantFlip = vsComputer && humanColor === 'b';
+  if (wantFlip !== flipped) { flipped = wantFlip; buildLabels(); buildBoardSquares(); }
+  render();
+}
+
+document.getElementById('restartBtn').addEventListener('click', startNewGame);
+
+function wireSeg(id, onPick) {
+  const btns = document.querySelectorAll('#' + id + ' .seg-btn');
+  btns.forEach(btn => btn.addEventListener('click', () => {
+    btns.forEach(b => b.classList.toggle('active', b === btn));
+    onPick(btn.dataset.value);
+  }));
+}
+wireSeg('modeSeg', (v) => {
+  vsComputer = v === 'ai';
+  document.getElementById('aiOptions').classList.toggle('off', !vsComputer);
+  startNewGame();
 });
+wireSeg('levelSeg', (v) => { aiLevel = v; });     // applies from the computer's next move
+wireSeg('colorSeg', (v) => { humanColor = v; startNewGame(); });
 
 const difficultyNotes = {
   1: 'Король побеждает, если сразу следующим ходом соперник не объявит шах.',
